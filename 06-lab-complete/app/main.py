@@ -14,25 +14,28 @@ Checklist:
   ✅ CORS
   ✅ Error handling
 """
-import os
 import time
 import signal
 import logging
 import json
 from datetime import datetime, timezone
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
-from fastapi.security.api_key import APIKeyHeader
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 
+from app.auth import verify_api_key
 from app.config import settings
+from app.cost_guard import CostGuard
+from app.rate_limiter import RateLimiter
 
 # Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
 from utils.mock_llm import ask as llm_ask
+
+INPUT_COST_PER_1000 = 0.00015
+OUTPUT_COST_PER_1000 = 0.0006
 
 # ─────────────────────────────────────────────────────────
 # Logging — JSON structured
@@ -43,58 +46,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────
 START_TIME = time.time()
 _is_ready = False
 _request_count = 0
 _error_count = 0
 
-# ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
-# ─────────────────────────────────────────────────────────
-_rate_windows: dict[str, deque] = defaultdict(deque)
 
-def check_rate_limit(key: str):
-    now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
-
-# ─────────────────────────────────────────────────────────
-# Simple Cost Guard
-# ─────────────────────────────────────────────────────────
-_daily_cost = 0.0
-_cost_reset_day = time.strftime("%Y-%m-%d")
-
-def check_and_record_cost(input_tokens: int, output_tokens: int):
-    global _daily_cost, _cost_reset_day
-    today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
-
-# ─────────────────────────────────────────────────────────
-# Auth
-# ─────────────────────────────────────────────────────────
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-def verify_api_key(api_key: str = Security(api_key_header)) -> str:
-    if not api_key or api_key != settings.agent_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key. Include header: X-API-Key: <key>",
-        )
-    return api_key
+def _estimate_cost(tokens: int, per_1000: float) -> float:
+    return (tokens / 1000) * per_1000
 
 # ─────────────────────────────────────────────────────────
 # Lifespan
@@ -102,6 +62,11 @@ def verify_api_key(api_key: str = Security(api_key_header)) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _is_ready
+    redis_client = settings.redis_client
+    app.state.redis = redis_client
+    app.state.rate_limiter = RateLimiter(redis_client, settings.rate_limit_per_minute)
+    app.state.cost_guard = CostGuard(redis_client, settings.monthly_budget_usd)
+
     logger.info(json.dumps({
         "event": "startup",
         "app": settings.app_name,
@@ -112,10 +77,12 @@ async def lifespan(app: FastAPI):
     _is_ready = True
     logger.info(json.dumps({"event": "ready"}))
 
-    yield
-
-    _is_ready = False
-    logger.info(json.dumps({"event": "shutdown"}))
+    try:
+        yield
+    finally:
+        _is_ready = False
+        logger.info(json.dumps({"event": "shutdown"}))
+        redis_client.close()
 
 # ─────────────────────────────────────────────────────────
 # App
@@ -145,7 +112,9 @@ async def request_middleware(request: Request, call_next):
         # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
+        # ✅ FIX: Safely remove server header
+        if "server" in response.headers:
+            del response.headers["server"]
         duration = round((time.time() - start) * 1000, 1)
         logger.info(json.dumps({
             "event": "request",
@@ -201,12 +170,14 @@ async def ask_agent(
 
     **Authentication:** Include header `X-API-Key: <your-key>`
     """
-    # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
+    # Rate limit per API key bucket
+    bucket = _key[:12]
+    request.app.state.rate_limiter.check(bucket)
 
-    # Budget check
+    # Budget check for request
     input_tokens = len(body.question.split()) * 2
-    check_and_record_cost(input_tokens, 0)
+    input_cost = _estimate_cost(input_tokens, INPUT_COST_PER_1000)
+    request.app.state.cost_guard.record_cost(input_cost)
 
     logger.info(json.dumps({
         "event": "agent_call",
@@ -217,7 +188,13 @@ async def ask_agent(
     answer = llm_ask(body.question)
 
     output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
+    output_cost = _estimate_cost(output_tokens, OUTPUT_COST_PER_1000)
+    request.app.state.cost_guard.record_cost(output_cost)
+
+    logger.info(json.dumps({
+        "event": "cost",
+        "monthly_spend_usd": round(request.app.state.cost_guard.current_spend(), 6),
+    }))
 
     return AskResponse(
         question=body.question,
@@ -254,13 +231,18 @@ def ready():
 @app.get("/metrics", tags=["Operations"])
 def metrics(_key: str = Depends(verify_api_key)):
     """Basic metrics (protected)."""
+    spending = app.state.cost_guard.current_spend()
+    budget_pct = round(
+        (spending / settings.monthly_budget_usd * 100) if settings.monthly_budget_usd else 0.0,
+        1,
+    )
     return {
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
         "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
-        "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
+        "monthly_spend_usd": round(spending, 4),
+        "monthly_budget_usd": settings.monthly_budget_usd,
+        "budget_used_pct": budget_pct,
     }
 
 

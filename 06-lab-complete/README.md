@@ -12,6 +12,7 @@ Kết hợp TẤT CẢ những gì đã học trong 1 project hoàn chỉnh.
 - [x] API Key authentication
 - [x] Rate limiting
 - [x] Cost guard
+- [x] Redis-backed state (rate limit 10 req/min + $10/month budget)
 - [x] Config từ environment variables
 - [x] Structured logging
 - [x] Graceful shutdown
@@ -59,6 +60,8 @@ curl -H "X-API-Key: $API_KEY" \
      -H "Content-Type: application/json" \
      -d '{"question": "What is deployment?"}'
 ```
+
+`docker-compose.yml` wires Redis at `redis://redis:6379/0`. Redis handles the 10 req/min rate limit and $10/month cost guard so the agent stays stateless.
 
 ---
 

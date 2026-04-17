@@ -2,6 +2,10 @@
 import os
 import logging
 from dataclasses import dataclass, field
+from functools import cached_property
+
+from redis import Redis
+from redis.exceptions import RedisError
 
 
 @dataclass
@@ -29,16 +33,40 @@ class Settings:
 
     # Rate limiting
     rate_limit_per_minute: int = field(
-        default_factory=lambda: int(os.getenv("RATE_LIMIT_PER_MINUTE", "20"))
+        default_factory=lambda: int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
     )
 
     # Budget
-    daily_budget_usd: float = field(
-        default_factory=lambda: float(os.getenv("DAILY_BUDGET_USD", "5.0"))
+    monthly_budget_usd: float = field(
+        default_factory=lambda: float(os.getenv("MONTHLY_BUDGET_USD", "10.0"))
     )
 
     # Storage
-    redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", ""))
+    redis_url: str = field(
+        default_factory=lambda: os.getenv("REDIS_URL", "redis://redis:6379/0")
+    )
+
+    @cached_property
+    def redis_client(self) -> Redis:
+        return self._connect_redis()
+
+    def _connect_redis(self) -> Redis:
+        """Connect to Redis with proper error handling."""
+        logger = logging.getLogger(__name__)
+        try:
+            logger.info(f"Connecting to Redis at: {self.redis_url}")
+            client = Redis.from_url(self.redis_url, decode_responses=True)
+            client.ping()
+            logger.info("✅ Redis connected successfully")
+            return client
+        except RedisError as exc:
+            logger.error(f"❌ Redis connection failed: {exc}")
+            # Don't raise in development, just return None
+            if self.environment == "production":
+                raise RuntimeError(
+                    f"Cannot connect to Redis at {self.redis_url}: {exc}"
+                ) from exc
+            return None
 
     def validate(self):
         logger = logging.getLogger(__name__)
@@ -47,6 +75,8 @@ class Settings:
                 raise ValueError("AGENT_API_KEY must be set in production!")
             if self.jwt_secret == "dev-jwt-secret":
                 raise ValueError("JWT_SECRET must be set in production!")
+            if self.redis_url == "redis://localhost:6379/0":
+                logger.warning("Using localhost Redis in production! Set REDIS_URL properly.")
         if not self.openai_api_key:
             logger.warning("OPENAI_API_KEY not set — using mock LLM")
         return self
