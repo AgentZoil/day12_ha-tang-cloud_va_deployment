@@ -14,7 +14,7 @@ import json
 import urllib.request
 import urllib.error
 
-BASE_URL = "http://localhost:8080"
+BASE_URL = "http://localhost:8000"
 session_id = None
 
 
